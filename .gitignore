@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 环境变量配置
+.env
+*.env
+
+# 编辑器/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统文件
+.DS_Store
+Thumbs.db
