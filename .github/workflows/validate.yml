@@ -1,0 +1,45 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  hacs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hacs/action@main
+        with:
+          category: integration
+
+  hassfest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: home-assistant/actions/hassfest@master
+
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate JSON metadata and translations
+        run: |
+          python -m json.tool hacs.json >/dev/null
+          python -m json.tool custom_components/mili_door/manifest.json >/dev/null
+          python -m json.tool custom_components/mili_door/strings.json >/dev/null
+          python -m json.tool custom_components/mili_door/translations/en.json >/dev/null
+          python -m json.tool custom_components/mili_door/translations/zh-Hans.json >/dev/null
+      - name: Compile Python sources
+        run: python -m compileall -q .
+      - name: Run protocol regression tests
+        run: python -m unittest discover -s tests -v
+      - name: Check shell syntax
+        run: |
+          sh -n deploy/S99mili
+          sh -n deploy/start_gateway.sh
+          sh -n deploy/setup_board.sh
+          sh -n deploy/make_bundle.sh

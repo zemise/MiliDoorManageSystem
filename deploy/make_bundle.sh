@@ -17,6 +17,7 @@ mkdir -p "$STAGE/mili-gateway/stubs/argon2"
 cp "$ROOT/gateway.py" \
    "$ROOT/protocol.py" \
    "$ROOT/rtsp_inproc.py" \
+   "$ROOT/rtsp_light.py" \
    "$ROOT/local_io.py" \
    "$ROOT/unlock_test.py" \
    "$STAGE/mili-gateway/"
@@ -32,7 +33,7 @@ cp "$ROOT/deploy/start_gateway.sh" \
    "$ROOT/deploy/README.md" \
    "$STAGE/mili-gateway/"
 
-# amqtt 匿名认证插件的 argon2 导入 stub
+# 兼容 LOCAL_MQTT_BROKER=1 旧部署所需的 argon2 导入 stub
 cp "$ROOT/deploy/stubs/argon2/__init__.py" \
    "$ROOT/deploy/stubs/argon2/exceptions.py" \
    "$STAGE/mili-gateway/stubs/argon2/"

@@ -7,6 +7,7 @@
 - [功能特性](#功能特性)
 - [快速开始](#快速开始)
 - [架构说明](#架构说明)
+- [Home Assistant 接入](#home-assistant-接入)
 - [MQTT 协议](#mqtt-协议)
 - [配置说明](#配置说明)
 - [依赖安装](#依赖安装)
@@ -25,7 +26,7 @@
 
 ```bash
 pip install paho-mqtt
-# RTSP 功能需要 GStreamer（可选）
+# 默认的轻量 RTSP 后端无额外 Python 依赖
 ```
 
 ### 2. 配置环境变量
@@ -42,7 +43,7 @@ export DOOR_IP_1="192.168.1.10"
 python3 gateway.py
 ```
 
-> 板端常驻部署（LicheeRV Nano，含本地 MQTT broker 和开机自启）见 [`deploy/README.md`](deploy/README.md)。
+> 板端常驻部署（LicheeRV Nano，推荐连接 HA Mosquitto）见 [`deploy/README.md`](deploy/README.md)。
 
 ### 4. 测试命令
 
@@ -107,12 +108,52 @@ python3 unlock_test.py 192.168.1.10 --print-hex
 ### 工作流程
 
 ```
-APP → MQTT → 网关 → UDP/14301 → 门禁
+Home Assistant / APP → MQTT → 网关 → UDP/14301 → 门禁
                 ↓
             RTSP 服务器 ← RTP 流 ← 门禁
                 ↓
-            APP (播放视频/音频)
+            Home Assistant / APP
 ```
+
+## Home Assistant 接入
+
+仓库内置 `custom_components/mili_door`，可通过 HACS 的“自定义存储库”安装。
+
+### 1. 准备 MQTT
+
+在 Home Assistant 中安装 Mosquitto Broker，并为荔枝派创建独立用户。板端
+`gateway.env` 至少配置：
+
+```dotenv
+MQTT_HOST=<Home Assistant/Mosquitto IP>
+MQTT_PORT=1883
+MQTT_USERNAME=<gateway user>
+MQTT_PASSWORD=<gateway password>
+MQTT_TOPIC_PREFIX=mili/door
+RTSP_HOST=<Home Assistant 可访问的荔枝派 IP>
+RTSP_BACKEND=light
+DOOR_IP_1=<门禁 IP>
+```
+
+### 2. 通过 HACS 安装
+
+1. HACS → Integrations → 右上角菜单 → Custom repositories。
+2. 输入本 GitHub 仓库地址，类别选择 `Integration`。
+3. 安装 **Mili Door Gateway** 并重启 Home Assistant。
+4. 设置 → 设备与服务 → 添加集成 → **Mili Door Gateway**。
+
+配置项：
+
+- Gateway host：荔枝派在家庭局域网的 IP。
+- MQTT topic prefix：必须与板端 `MQTT_TOPIC_PREFIX` 一致。
+- Door IDs：如 `1` 或 `1,2`。
+- RTSP 端口/路径：默认 `8554` 和 `/video`。
+
+每路门禁会生成开锁、接听、挂断按钮，响铃二进制传感器，通话状态，
+门铃事件和 RTSP Camera。
+
+也可手工将 `custom_components/mili_door` 复制到 HA 配置目录下的
+`custom_components/`，但这种方式不会自动跟踪 GitHub 版本。
 
 ## MQTT 协议
 
@@ -122,6 +163,8 @@ APP → MQTT → 网关 → UDP/14301 → 门禁
 
 - **命令** (APP → 网关): `<prefix>/<door_id>`
 - **事件** (网关 → APP): `<prefix>/<door_id>/event`
+- **状态** (网关 → HA): `<prefix>/<door_id>/state`（保留消息）
+- **在线状态**: `<prefix>/gateway/availability`（`online/offline`）
 
 `door_id` 默认为 `1~4`，对应 `DOOR_IP_1~4` 环境变量。
 
@@ -189,6 +232,8 @@ APP → MQTT → 网关 → UDP/14301 → 门禁
 |---------|--------|------|
 | `MQTT_HOST` | **无默认值（必填）** | MQTT 服务器地址 |
 | `MQTT_PORT` | `1883` | MQTT 服务器端口 |
+| `MQTT_USERNAME` | *(空)* | MQTT 用户名 |
+| `MQTT_PASSWORD` | *(空)* | MQTT 密码 |
 | `MQTT_TOPIC_PREFIX` | **无默认值（必填）** | MQTT 主题前缀 |
 | `MQTT_EVENT_SUFFIX` | `event` | 事件主题后缀 |
 | `MQTT_INCOMING_CALL_REPEAT_S` | `1` | `incoming_call` 重复发布间隔（秒）；`<=0` 禁用 |
@@ -211,6 +256,7 @@ APP → MQTT → 网关 → UDP/14301 → 门禁
 | `RTSP_AUDIO_PORT` | `8555` | 音频 RTSP 端口 |
 | `RTSP_VIDEO_MOUNT` | `/video` | 视频挂载路径 |
 | `RTSP_AUDIO_MOUNT` | `/audio` | 音频挂载路径 |
+| `RTSP_BACKEND` | `light` | `light` 或 `gstreamer`，两者不会同时启动 |
 
 ### 本地 I/O 配置
 
@@ -242,9 +288,10 @@ APP → MQTT → 网关 → UDP/14301 → 门禁
 pip install paho-mqtt
 ```
 
-### RTSP 功能（推荐）
+### GStreamer RTSP 后端（可选）
 
-需要安装 GStreamer 和相关 Python 绑定：
+默认 `RTSP_BACKEND=light` 使用纯 Python RTP 转发，荔枝派上无需安装
+GStreamer。仅在改为 `RTSP_BACKEND=gstreamer` 时需要安装以下依赖：
 
 **Ubuntu/Debian:**
 
@@ -287,17 +334,22 @@ sudo apt-get install wiringpi
 
 ### RTSP 无法播放
 
-1. 检查 GStreamer 是否正确安装：
+1. 检查当前后端：
+   ```bash
+   echo "$RTSP_BACKEND"
+   ```
+
+2. 仅当选择 `gstreamer` 时检查 GStreamer：
    ```bash
    gst-launch-1.0 --version
    ```
 
-2. 检查端口是否被占用：
+3. 检查端口是否被占用：
    ```bash
    netstat -tuln | grep 8554
    ```
 
-3. 检查防火墙规则：
+4. 检查防火墙规则：
    ```bash
    sudo ufw allow 8554/tcp
    sudo ufw allow 8555/tcp

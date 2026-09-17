@@ -1,0 +1,49 @@
+{
+  "title": "Mili Door Gateway",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect a Mili Door gateway",
+        "description": "Home Assistant must already be connected to the same MQTT broker as the gateway.",
+        "data": {
+          "host": "Gateway host",
+          "topic_prefix": "MQTT topic prefix",
+          "door_ids": "Door IDs",
+          "rtsp_video_port": "RTSP video port",
+          "rtsp_video_mount": "RTSP video path"
+        },
+        "data_description": {
+          "host": "The gateway IP address reachable from Home Assistant.",
+          "door_ids": "Comma-separated IDs, for example: 1,2"
+        }
+      }
+    },
+    "error": {
+      "required": "This field is required.",
+      "invalid_door_ids": "Enter one or more IDs without slashes.",
+      "invalid_mount": "The RTSP path must start with /."
+    },
+    "abort": {
+      "already_configured": "This gateway is already configured."
+    }
+  },
+  "entity": {
+    "button": {
+      "unlock": {"name": "Unlock"},
+      "answer": {"name": "Answer"},
+      "hangup": {"name": "Hang up"}
+    },
+    "binary_sensor": {
+      "ringing": {"name": "Ringing"}
+    },
+    "sensor": {
+      "call_state": {"name": "Call state"}
+    },
+    "event": {
+      "call_event": {"name": "Call event"}
+    },
+    "camera": {
+      "camera": {"name": "Camera"}
+    }
+  }
+}

@@ -18,7 +18,7 @@ from __future__ import annotations
 import socket
 import struct
 import threading
-from typing import Callable, Optional
+from typing import Callable
 
 
 class LightRtspMount:
@@ -32,8 +32,8 @@ class LightRtspMount:
         clock_rate: int,
         media: str,
         log: Callable[[str], None],
-        on_play: Callable[[], None],
-        on_teardown: Callable[[], None],
+        on_play: Callable[[str], None],
+        on_teardown: Callable[[str], None],
     ) -> None:
         self._port = int(port)
         self._udp_port = int(udp_port)
@@ -48,6 +48,8 @@ class LightRtspMount:
         self._stop = threading.Event()
         self._clients_lock = threading.Lock()
         self._clients: dict[object, bool] = {}  # conn -> playing
+        self._send_locks: dict[object, threading.Lock] = {}
+        self._client_paths: dict[object, str] = {}
 
         self._sdp = (
             "v=0\r\n"
@@ -76,13 +78,22 @@ class LightRtspMount:
             target=self._accept_loop, name=f"RTSP-{media}-accept", daemon=True
         )
         self._accept_thread.start()
+        # A single UDP reader must fan each RTP packet out to all clients.  If
+        # every client called recvfrom() itself, concurrent viewers would split
+        # the packet stream and all of them would see corrupted video/audio.
+        self._forward_thread = threading.Thread(
+            target=self._forward_loop, name=f"RTSP-{media}-forward", daemon=True
+        )
+        self._forward_thread.start()
         self._log(f"[RTSP] light {media} listening: rtsp://0.0.0.0:{self._port} (UDP:{self._udp_port})")
 
     # --- lifecycle
 
     def close(self) -> None:
         self._stop.set()
-        for conn in list(self._clients):
+        with self._clients_lock:
+            clients = list(self._clients)
+        for conn in clients:
             try:
                 conn.close()
             except OSError:
@@ -108,19 +119,20 @@ class LightRtspMount:
                 break
             with self._clients_lock:
                 self._clients[conn] = False
+                self._send_locks[conn] = threading.Lock()
             threading.Thread(
                 target=self._handle_client, args=(conn, addr), name=f"RTSP-{self._media}-client", daemon=True
             ).start()
 
     def _handle_client(self, conn: socket.socket, addr) -> None:
         conn.settimeout(5.0)
-        forward_stop = threading.Event()
-        forward_thread: Optional[threading.Thread] = None
         playing = False
+        play_path = ""
         buf = b""
+        terminate = False
 
         try:
-            while not self._stop.is_set():
+            while not self._stop.is_set() and not terminate:
                 try:
                     data = conn.recv(4096)
                 except socket.timeout:
@@ -135,35 +147,43 @@ class LightRtspMount:
                     response, should_play, should_teardown, close_after = self._handle_request(head)
                     if response:
                         try:
-                            conn.sendall(response)
+                            with self._send_locks[conn]:
+                                conn.sendall(response)
                         except OSError:
                             close_after = True
                     if should_play and not playing:
                         playing = True
+                        request_line = head.split(b"\r\n", 1)[0].decode(errors="ignore")
+                        request_parts = request_line.split(" ")
+                        play_path = request_parts[1] if len(request_parts) >= 2 else ""
                         with self._clients_lock:
-                            was_any = any(self._clients.values())
+                            active_paths = {
+                                self._client_paths.get(client, "")
+                                for client, is_playing in self._clients.items()
+                                if is_playing
+                            }
                             self._clients[conn] = True
-                        if not was_any:
+                            self._client_paths[conn] = play_path
+                        if not active_paths or play_path not in active_paths:
                             try:
-                                self._on_play()
+                                self._on_play(play_path)
                             except Exception as e:
                                 self._log(f"[RTSP] on_play error: {e}")
-                        forward_stop.clear()
-                        forward_thread = threading.Thread(
-                            target=self._forward_loop, args=(conn, forward_stop), daemon=True
-                        )
-                        forward_thread.start()
                     if should_teardown or close_after:
+                        terminate = True
                         break
         finally:
-            if forward_thread:
-                forward_stop.set()
             with self._clients_lock:
                 self._clients.pop(conn, None)
-                any_left = any(self._clients.values())
-            if playing and not any_left:
+                self._send_locks.pop(conn, None)
+                self._client_paths.pop(conn, None)
+                same_path_left = any(
+                    is_playing and self._client_paths.get(client) == play_path
+                    for client, is_playing in self._clients.items()
+                )
+            if playing and not same_path_left:
                 try:
-                    self._on_teardown()
+                    self._on_teardown(play_path)
                 except Exception as e:
                     self._log(f"[RTSP] on_teardown error: {e}")
             try:
@@ -225,10 +245,10 @@ class LightRtspMount:
 
         return (f"RTSP/1.0 405 Method Not Allowed\r\nCSeq: {cseq}\r\n\r\n").encode(), False, False, False
 
-    def _forward_loop(self, conn: socket.socket, stop: threading.Event) -> None:
+    def _forward_loop(self) -> None:
         # RTP over TCP: $ + channel(1B) + length(2B BE) + RTP packet
         channel = 0
-        while not stop.is_set() and not self._stop.is_set():
+        while not self._stop.is_set():
             try:
                 data, _ = self._udp.recvfrom(65535)
             except socket.timeout:
@@ -238,7 +258,20 @@ class LightRtspMount:
             if not data:
                 continue
             frame = b"$" + bytes([channel]) + struct.pack(">H", len(data)) + data
-            try:
-                conn.sendall(frame)
-            except OSError:
-                break
+            with self._clients_lock:
+                targets = [
+                    (conn, self._send_locks.get(conn))
+                    for conn, playing in self._clients.items()
+                    if playing
+                ]
+            for conn, send_lock in targets:
+                if send_lock is None:
+                    continue
+                try:
+                    with send_lock:
+                        conn.sendall(frame)
+                except OSError:
+                    try:
+                        conn.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass

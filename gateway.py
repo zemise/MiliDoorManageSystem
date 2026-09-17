@@ -27,6 +27,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 try:
     import paho.mqtt.client as mqtt
@@ -145,6 +146,8 @@ class Config:
     mqtt_host: str = os.environ["MQTT_HOST"]
     mqtt_port: int = int(os.getenv("MQTT_PORT", "1883"))
     topic_prefix: str = os.environ["MQTT_TOPIC_PREFIX"]
+    mqtt_username: str = os.getenv("MQTT_USERNAME", "")
+    mqtt_password: str = os.getenv("MQTT_PASSWORD", "")
 
     # MQTT 主题：
     # - 命令：<prefix>/<id>  负载：unlock/video/audio/exit/answer/hangup
@@ -160,6 +163,7 @@ class Config:
     rtsp_audio_port: int = int(os.getenv("RTSP_AUDIO_PORT", "8555"))
     rtsp_video_mount: str = os.getenv("RTSP_VIDEO_MOUNT", "/video")
     rtsp_audio_mount: str = os.getenv("RTSP_AUDIO_MOUNT", "/audio")
+    rtsp_backend: str = os.getenv("RTSP_BACKEND", "light").strip().lower()
 
     ring_wav: str = os.getenv(
         "BELL_WAV_PATH",
@@ -190,28 +194,76 @@ class Config:
     def event_topic(self, door_id: str) -> str:
         return f"{self.topic_prefix}/{door_id}/{self.event_suffix}"
 
+    def state_topic(self, door_id: str) -> str:
+        return f"{self.topic_prefix}/{door_id}/state"
+
+    @property
+    def availability_topic(self) -> str:
+        return f"{self.topic_prefix}/gateway/availability"
+
 
 class RtspManager:
-    def __init__(self, config: Config):
+    """Own exactly one RTSP implementation so ports are never double-bound."""
+
+    def __init__(self, config: Config, *, on_play, on_teardown):
         self._cfg = config
-        self._inproc = InProcRtspServers(
-            video_rtsp_port=self._cfg.rtsp_video_port,
-            video_mount=self._cfg.rtsp_video_mount,
-            video_udp_port=VIDEO_UDP_PORT,
-            audio_rtsp_port=self._cfg.rtsp_audio_port,
-            audio_mount=self._cfg.rtsp_audio_mount,
-            audio_udp_port=AUDIO_UDP_PORT,
+        self._inproc: Optional[InProcRtspServers] = None
+        self._light_video: Optional[LightRtspMount] = None
+        self._light_audio: Optional[LightRtspMount] = None
+
+        if self._cfg.rtsp_backend == "gstreamer":
+            self._inproc = InProcRtspServers(
+                video_rtsp_port=self._cfg.rtsp_video_port,
+                video_mount=self._cfg.rtsp_video_mount,
+                video_udp_port=VIDEO_UDP_PORT,
+                audio_rtsp_port=self._cfg.rtsp_audio_port,
+                audio_mount=self._cfg.rtsp_audio_mount,
+                audio_udp_port=AUDIO_UDP_PORT,
+                log=_log,
+            )
+            return
+
+        if self._cfg.rtsp_backend != "light":
+            raise ValueError("RTSP_BACKEND must be 'light' or 'gstreamer'")
+
+        self._light_video = LightRtspMount(
+            port=self._cfg.rtsp_video_port,
+            udp_port=VIDEO_UDP_PORT,
+            payload_type=98,
+            codec="H264",
+            clock_rate=90000,
+            media="video",
             log=_log,
+            on_play=lambda path: on_play("video", path),
+            on_teardown=lambda path: on_teardown("video", path),
+        )
+        self._light_audio = LightRtspMount(
+            port=self._cfg.rtsp_audio_port,
+            udp_port=AUDIO_UDP_PORT,
+            payload_type=8,
+            codec="PCMA",
+            clock_rate=8000,
+            media="audio",
+            log=_log,
+            on_play=lambda path: on_play("audio", path),
+            on_teardown=lambda path: on_teardown("audio", path),
         )
 
     def ensure_video(self) -> None:
-        self._inproc.ensure_video()
+        if self._inproc:
+            self._inproc.ensure_video()
 
     def ensure_audio(self) -> None:
-        self._inproc.ensure_audio()
+        if self._inproc:
+            self._inproc.ensure_audio()
 
     def stop(self) -> None:
-        self._inproc.stop()
+        if self._inproc:
+            self._inproc.stop()
+        if self._light_video:
+            self._light_video.close()
+        if self._light_audio:
+            self._light_audio.close()
 
 
 @dataclass
@@ -235,7 +287,6 @@ class CallSession:
 class Gateway:
     def __init__(self, config: Config):
         self._cfg = config
-        self._rtsp = RtspManager(config)
 
         self._stop_event = threading.Event()
         self._udp_thread: Optional[threading.Thread] = None
@@ -250,6 +301,11 @@ class Gateway:
         # - _idle_video_hb: 空闲视频保活线程（按 door_id）
         self._idle_open_doors: set[str] = set()
         self._idle_video_hb: dict[str, tuple[threading.Event, threading.Thread]] = {}
+        self._door_states: dict[str, dict[str, Any]] = {
+            door_id: {"state": "idle", "door_ip": door_ip}
+            for door_id, door_ip in self._cfg.door_ip_by_id.items()
+            if door_ip
+        }
 
         self._udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -268,36 +324,23 @@ class Gateway:
         )
 
         self._mqtt = mqtt.Client()
+        if self._cfg.mqtt_username:
+            self._mqtt.username_pw_set(self._cfg.mqtt_username, self._cfg.mqtt_password)
+        self._mqtt.will_set(self._cfg.availability_topic, "offline", qos=1, retain=True)
         self._mqtt.on_connect = self._on_mqtt_connect
         self._mqtt.on_message = self._on_mqtt_message
 
         # 为来电映射 ip -> id
-        self._id_by_ip = {ip: door_id for door_id, ip in self._cfg.door_ip_by_id.items()}
+        self._id_by_ip = {
+            ip: door_id for door_id, ip in self._cfg.door_ip_by_id.items() if ip
+        }
         # 门禁中心控制器（面板会定期向它注册；REGISTRAR_IP 配置）
         self._registrar_ip = os.getenv("REGISTRAR_IP", "")
 
-        # 轻量 RTSP 服务（无 GStreamer 依赖）：客户端播放时自动触发门禁推流
-        self._rtsp_light_video = LightRtspMount(
-            port=self._cfg.rtsp_video_port,
-            udp_port=VIDEO_UDP_PORT,
-            payload_type=98,
-            codec="H264",
-            clock_rate=90000,
-            media="video",
-            log=_log,
-            on_play=lambda: self._light_play("video"),
-            on_teardown=lambda: self._light_teardown("video"),
-        )
-        self._rtsp_light_audio = LightRtspMount(
-            port=self._cfg.rtsp_audio_port,
-            udp_port=AUDIO_UDP_PORT,
-            payload_type=8,
-            codec="PCMA",
-            clock_rate=8000,
-            media="audio",
-            log=_log,
-            on_play=lambda: self._light_play("audio"),
-            on_teardown=lambda: self._light_teardown("audio"),
+        self._rtsp = RtspManager(
+            config,
+            on_play=self._light_play,
+            on_teardown=self._light_teardown,
         )
 
     # --- 生命周期
@@ -317,7 +360,7 @@ class Gateway:
         self._watchdog_thread.start()
 
         _log(f"[MQTT] connecting {self._cfg.mqtt_host}:{self._cfg.mqtt_port} ...")
-        self._mqtt.connect(self._cfg.mqtt_host, self._cfg.mqtt_port, keepalive=30)
+        self._mqtt.connect_async(self._cfg.mqtt_host, self._cfg.mqtt_port, keepalive=30)
         self._mqtt.loop_start()
 
     def stop(self) -> None:
@@ -327,11 +370,8 @@ class Gateway:
         except Exception:
             pass
         try:
-            self._rtsp_light_video.close()
-        except Exception:
-            pass
-        try:
-            self._rtsp_light_audio.close()
+            info = self._mqtt.publish(self._cfg.availability_topic, "offline", qos=1, retain=True)
+            info.wait_for_publish(timeout=1.0)
         except Exception:
             pass
         try:
@@ -350,8 +390,14 @@ class Gateway:
     # --- MQTT
 
     def _on_mqtt_connect(self, client: mqtt.Client, _userdata, _flags, rc, *args) -> None:
+        if int(rc) != 0:
+            _log(f"[MQTT] connection rejected rc={rc}")
+            return
         _log(f"[MQTT] connected rc={rc}; subscribe {self._cfg.cmd_subscribe_topic}")
-        client.subscribe(self._cfg.cmd_subscribe_topic)
+        client.subscribe(self._cfg.cmd_subscribe_topic, qos=1)
+        client.publish(self._cfg.availability_topic, "online", qos=1, retain=True)
+        for door_id, state in self._door_states.items():
+            self._publish_state(door_id, **state)
 
     def _publish_event(self, door_id: str, event_type: str, **fields: Any) -> None:
         payload = {
@@ -361,18 +407,35 @@ class Gateway:
         }
         topic = self._cfg.event_topic(door_id)
         try:
-            self._mqtt.publish(topic, json.dumps(payload, ensure_ascii=False))
+            self._mqtt.publish(topic, json.dumps(payload, ensure_ascii=False), qos=1, retain=False)
         except Exception as e:
             _log(f"[MQTT] publish failed: {e}")
 
+    def _publish_state(self, door_id: str, state: str, **fields: Any) -> None:
+        payload = {
+            "state": state,
+            "ts": _now(),
+            **fields,
+        }
+        self._door_states[door_id] = {"state": state, **fields}
+        try:
+            self._mqtt.publish(
+                self._cfg.state_topic(door_id),
+                json.dumps(payload, ensure_ascii=False),
+                qos=1,
+                retain=True,
+            )
+        except Exception as e:
+            _log(f"[MQTT] state publish failed: {e}")
+
     def _on_mqtt_message(self, _client: mqtt.Client, _userdata, msg) -> None:
         topic = msg.topic or ""
-        parts = topic.split("/")
-        if len(parts) != 3:
+        topic_base = f"{self._cfg.topic_prefix}/"
+        if not topic.startswith(topic_base):
             return
         # 主题：<prefix>/<id>
-        door_id = parts[-1].strip()
-        if not door_id:
+        door_id = topic[len(topic_base):].strip()
+        if not door_id or "/" in door_id:
             return
 
         raw = (msg.payload or b"").decode(errors="ignore").strip()
@@ -470,13 +533,27 @@ class Gateway:
             msg_id += 1
             time.sleep(60.0)
 
-    def _light_play(self, media: str) -> None:
-        _log(f"[RTSP] client play {media}; triggering door stream")
-        self._handle_cmd("1", media)
+    def _door_id_from_rtsp_path(self, media: str, request_uri: str) -> str:
+        mount = self._cfg.rtsp_video_mount if media == "video" else self._cfg.rtsp_audio_mount
+        path = urlparse(request_uri).path.rstrip("/")
+        mount = mount.rstrip("/")
+        candidate = path[len(mount) + 1 :] if path.startswith(f"{mount}/") else "1"
+        if self._cfg.door_ip_by_id.get(candidate):
+            return candidate
+        return next(
+            (door_id for door_id, door_ip in self._cfg.door_ip_by_id.items() if door_ip),
+            "1",
+        )
 
-    def _light_teardown(self, media: str) -> None:
-        _log(f"[RTSP] client teardown {media}; stopping door stream")
-        self._handle_cmd("1", "exit")
+    def _light_play(self, media: str, request_uri: str = "") -> None:
+        door_id = self._door_id_from_rtsp_path(media, request_uri)
+        _log(f"[RTSP] client play {media} door_id={door_id}; triggering door stream")
+        self._handle_cmd(door_id, media)
+
+    def _light_teardown(self, media: str, request_uri: str = "") -> None:
+        door_id = self._door_id_from_rtsp_path(media, request_uri)
+        _log(f"[RTSP] client teardown {media} door_id={door_id}; stopping door stream")
+        self._handle_cmd(door_id, "exit")
 
     # --- 呼叫处理
 
@@ -531,10 +608,16 @@ class Gateway:
             _log(f"[CALL] incoming from {door_ip} (door_id={door_id}) session_id={invite.session_id.hex()}")
             self._rtsp.ensure_video()
             self._bell.start()
+            self._publish_state(
+                door_id,
+                "ringing",
+                door_ip=door_ip,
+                session_id=invite.session_id.hex(),
+            )
             publish_incoming = True
 
         if publish_incoming:
-            rtsp_host = os.getenv("RTSP_HOST", _detect_local_ip(door_ip))
+            rtsp_host = os.getenv("RTSP_HOST") or _detect_local_ip(door_ip)
             self._publish_event(
                 door_id,
                 "incoming_call",
@@ -611,7 +694,14 @@ class Gateway:
         self._send_answer_action()
         self._start_answer_heartbeat()
 
-        rtsp_host = os.getenv("RTSP_HOST", _detect_local_ip(door_ip))
+        self._publish_state(
+            door_id,
+            "answered",
+            door_ip=door_ip,
+            session_id=invite.session_id.hex(),
+        )
+
+        rtsp_host = os.getenv("RTSP_HOST") or _detect_local_ip(door_ip)
         self._publish_event(
             door_id,
             "answered",
@@ -647,6 +737,7 @@ class Gateway:
             except Exception as e:
                 _log(f"[CALL] failed to send hangup: {e}")
 
+        self._publish_state(door_id, "idle", door_ip=door_ip)
         self._publish_event(door_id, "ended", door_ip=door_ip, session_id=invite.session_id.hex(), reason=reason)
 
     def _send_answer_action(self) -> None:
@@ -924,7 +1015,7 @@ class Gateway:
                 continue
 
             if publish_incoming:
-                rtsp_host = os.getenv("RTSP_HOST", _detect_local_ip(door_ip))
+                rtsp_host = os.getenv("RTSP_HOST") or _detect_local_ip(door_ip)
                 self._publish_event(
                     door_id,
                     "incoming_call",

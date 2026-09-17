@@ -1,0 +1,49 @@
+{
+  "title": "Mili 门禁网关",
+  "config": {
+    "step": {
+      "user": {
+        "title": "连接 Mili 门禁网关",
+        "description": "Home Assistant 需要先连接到与网关相同的 MQTT Broker。",
+        "data": {
+          "host": "网关地址",
+          "topic_prefix": "MQTT Topic 前缀",
+          "door_ids": "门禁 ID",
+          "rtsp_video_port": "RTSP 视频端口",
+          "rtsp_video_mount": "RTSP 视频路径"
+        },
+        "data_description": {
+          "host": "Home Assistant 可以访问的荔枝派 IP 地址。",
+          "door_ids": "使用英文逗号分隔，例如：1,2"
+        }
+      }
+    },
+    "error": {
+      "required": "此项为必填项。",
+      "invalid_door_ids": "请输入至少一个不含斜杠的 ID。",
+      "invalid_mount": "RTSP 路径必须以 /开头。"
+    },
+    "abort": {
+      "already_configured": "该网关已经配置。"
+    }
+  },
+  "entity": {
+    "button": {
+      "unlock": {"name": "开锁"},
+      "answer": {"name": "接听"},
+      "hangup": {"name": "挂断"}
+    },
+    "binary_sensor": {
+      "ringing": {"name": "正在响铃"}
+    },
+    "sensor": {
+      "call_state": {"name": "通话状态"}
+    },
+    "event": {
+      "call_event": {"name": "门铃事件"}
+    },
+    "camera": {
+      "camera": {"name": "门口摄像头"}
+    }
+  }
+}
