@@ -12,6 +12,9 @@ jobs:
       - uses: hacs/action@main
         with:
           category: integration
+          # This is a custom HACS repository. The upstream project has no
+          # declared license, so the fork must not invent one on its behalf.
+          ignore: brands license
 
   hassfest:
     runs-on: ubuntu-latest
