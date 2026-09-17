@@ -1,0 +1,17 @@
+#!/usr/bin/expect -f
+# 从板端拉取文件到本地（scp get）。
+# 用法: scp_get.exp <remote_src> <ip> <user> <password> <local_dst>
+set timeout 120
+set src  [lindex $argv 0]
+set ip   [lindex $argv 1]
+set user [lindex $argv 2]
+set pass [lindex $argv 3]
+set dst  [lindex $argv 4]
+
+spawn scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 $user@$ip:$src $dst
+expect {
+    -re "(?i)password:" { send -- "$pass\r"; exp_continue }
+    eof
+}
+catch wait result
+exit [lindex $result 3]

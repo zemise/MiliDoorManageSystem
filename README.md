@@ -39,9 +39,10 @@ export DOOR_IP_1="192.168.1.10"
 ### 3. 运行网关
 
 ```bash
-cd ac_gateway
 python3 gateway.py
 ```
+
+> 板端常驻部署（LicheeRV Nano，含本地 MQTT broker 和开机自启）见 [`deploy/README.md`](deploy/README.md)。
 
 ### 4. 测试命令
 
@@ -52,6 +53,44 @@ mosquitto_sub -h "$MQTT_HOST" -p "$MQTT_PORT" -t '<prefix>/+/event' -v
 # 发送开锁命令
 mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" -t '<prefix>/1' -m 'unlock'
 ```
+
+## 局域网最小控制（不依赖 MQTT）
+
+如果你不打算使用 APP 或 MQTT，而是希望在局域网电脑上直接控制门禁，可以先用最小开锁脚本验证协议是否可用。
+
+### 1. 先检查 IP 连通性
+
+```bash
+ping 192.168.1.10
+```
+
+### 2. 直接发送开锁报文
+
+```bash
+python3 unlock_test.py 192.168.1.10
+```
+
+脚本行为：
+- 先执行一次 `ping`
+- `ping` 成功后，直接向门禁 `14301/UDP` 发送空闲态开锁报文
+- 不依赖 MQTT、APP 或额外服务
+
+常用参数：
+
+```bash
+# 指定控制端口
+python3 unlock_test.py 192.168.1.10 --port 14301
+
+# 跳过 ping，直接发送
+python3 unlock_test.py 192.168.1.10 --skip-ping
+
+# 打印十六进制报文，便于抓包核对
+python3 unlock_test.py 192.168.1.10 --print-hex
+```
+
+注意：
+- 这个脚本发送的是“空闲态开锁”固定报文，适用于门禁当前不在通话中的场景。
+- 如果后续你还要做“接听/挂断/通话中动态开锁”，应继续复用 `protocol.py` 中的会话报文构造逻辑。
 
 ## 架构说明
 

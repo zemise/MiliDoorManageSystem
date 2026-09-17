@@ -44,6 +44,7 @@ from protocol import (
     CallInvite,
     build_answer_action,
     build_answer_heartbeat,
+    build_call_video,
     build_connected_ack,
     build_hangup,
     build_unlock,
@@ -51,6 +52,7 @@ from protocol import (
     parse_ctrl_packet,
 )
 from rtsp_inproc import InProcRtspServers
+from rtsp_light import LightRtspMount
 
 
 UDP_PORT = 14301
@@ -81,8 +83,8 @@ HEX_EXIT = (
     "b43c900631000100000000000000000032aaf0a300010000"
 )
 HEX_UNLOCK_IDLE = (
-    "08ff010800000000000000000000000053470000fe0200003300000000002800fe020000010101003200010000000000"
-    "b43c900631000100000000000000000032aaf0a000010000"
+    "08ff0108000000000000000000000000534700001f0200002b000000000028001f020000010101003200010000000000"
+    "46b4e41131000100000000000000000032aaf0a000010000"
 )
 
 
@@ -149,6 +151,8 @@ class Config:
     # - 事件：<prefix>/<id>/event 负载：JSON
     event_suffix: str = os.getenv("MQTT_EVENT_SUFFIX", "event")
     mqtt_incoming_call_repeat_s: float = float(os.getenv("MQTT_INCOMING_CALL_REPEAT_S", "1"))
+    # 测试用：检测到来电后自动接听（AUTO_ANSWER=1）
+    auto_answer: bool = os.getenv("AUTO_ANSWER", "0") == "1"
 
     udp_port: int = int(os.getenv("UDP_PORT", str(UDP_PORT)))
 
@@ -269,12 +273,39 @@ class Gateway:
 
         # 为来电映射 ip -> id
         self._id_by_ip = {ip: door_id for door_id, ip in self._cfg.door_ip_by_id.items()}
+        # 门禁中心控制器（面板会定期向它注册；REGISTRAR_IP 配置）
+        self._registrar_ip = os.getenv("REGISTRAR_IP", "")
+
+        # 轻量 RTSP 服务（无 GStreamer 依赖）：客户端播放时自动触发门禁推流
+        self._rtsp_light_video = LightRtspMount(
+            port=self._cfg.rtsp_video_port,
+            udp_port=VIDEO_UDP_PORT,
+            payload_type=98,
+            codec="H264",
+            clock_rate=90000,
+            media="video",
+            log=_log,
+            on_play=lambda: self._light_play("video"),
+            on_teardown=lambda: self._light_teardown("video"),
+        )
+        self._rtsp_light_audio = LightRtspMount(
+            port=self._cfg.rtsp_audio_port,
+            udp_port=AUDIO_UDP_PORT,
+            payload_type=8,
+            codec="PCMA",
+            clock_rate=8000,
+            media="audio",
+            log=_log,
+            on_play=lambda: self._light_play("audio"),
+            on_teardown=lambda: self._light_teardown("audio"),
+        )
 
     # --- 生命周期
 
     def start(self) -> None:
         _log(f"[UDP] listen 0.0.0.0:{self._cfg.udp_port} (tx also uses this source port)")
         self._button.start()
+        threading.Thread(target=self._registrar_worker, name="Registrar", daemon=True).start()
 
         # 两个后台线程：
         # - UDPWorker：解析门禁控制帧 + 呼叫邀请
@@ -293,6 +324,14 @@ class Gateway:
         self._stop_event.set()
         try:
             self._rtsp.stop()
+        except Exception:
+            pass
+        try:
+            self._rtsp_light_video.close()
+        except Exception:
+            pass
+        try:
+            self._rtsp_light_audio.close()
         except Exception:
             pass
         try:
@@ -386,11 +425,69 @@ class Gateway:
         with self._udp_send_lock:
             self._udp_sock.sendto(payload, (dst_ip, self._cfg.udp_port))
 
+    def _registrar_worker(self) -> None:
+        """向门禁中心控制器注册/保活（实测面板的 aa ff 61 + aa ff 54 报文）。
+
+        启动时先发一次完整注册（若存在 register250.bin），之后每 60s 发保活。
+        """
+        import struct as _struct
+
+        if not self._registrar_ip:
+            return
+
+        msg_id = 1
+        reg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "register250.bin")
+        if os.path.exists(reg_path):
+            try:
+                reg = bytearray(open(reg_path, "rb").read())
+                reg[0x14:0x18] = _struct.pack("<I", msg_id)
+                reg[0x20:0x24] = _struct.pack("<I", msg_id)
+                self._udp_send(self._registrar_ip, bytes(reg))
+                _log(f"[REG] sent full registration msg_id={msg_id}")
+                msg_id += 1
+            except Exception as e:
+                _log(f"[REG] full registration failed: {e}")
+
+        while not self._stop_event.is_set():
+            try:
+                body = _struct.pack("<I", msg_id) + bytes.fromhex(
+                    "0101ff00320001000000000046b4e41120000100000000000000000032aaff5400010000"
+                )
+                pkt = (
+                    bytes.fromhex("08ff0108")
+                    + b"\x00" * 12
+                    + b"SG\x00\x00"
+                    + _struct.pack("<I", msg_id)
+                    + _struct.pack("<I", 0x2B)
+                    + _struct.pack("<H", 0)
+                    + _struct.pack("<H", len(body))
+                    + body
+                )
+                self._udp_send(self._registrar_ip, pkt)
+                _log(f"[REG] sent registration msg_id={msg_id}")
+            except Exception as e:
+                _log(f"[REG] registration failed: {e}")
+            msg_id += 1
+            time.sleep(60.0)
+
+    def _light_play(self, media: str) -> None:
+        _log(f"[RTSP] client play {media}; triggering door stream")
+        self._handle_cmd("1", media)
+
+    def _light_teardown(self, media: str) -> None:
+        _log(f"[RTSP] client teardown {media}; stopping door stream")
+        self._handle_cmd("1", "exit")
+
     # --- 呼叫处理
 
     def _handle_call_invite(self, invite: CallInvite) -> None:
         door_ip = invite.door_ip
-        door_id = self._id_by_ip.get(door_ip, "unknown")
+        door_id = self._id_by_ip.get(door_ip)
+        if door_id is None:
+            # 门禁网络上还有其他设备（192.168.21.21 / 192.168.16.11 等）也在
+            # 广播同类邀请；只处理已配置 DOOR_IP_* 的门禁，避免误接。
+            _log(f"[CALL] ignore invite from unconfigured ip {door_ip} (expected DOOR_IP_*)")
+            return
 
         now = time.monotonic()
         publish_ignored = False
@@ -453,6 +550,26 @@ class Gateway:
         except Exception as e:
             _log(f"[CALL] failed to send connected ack: {e}")
 
+        # 测试用：AUTO_ANSWER=1 时，检测到来电后自动接听（面板真实应答格式）。
+        # 实测面板在来电应答(88B)后约 1.2s 才发开视频(106B)，这里模拟该节奏。
+        if self._cfg.auto_answer:
+            with self._session_lock:
+                should_answer = (
+                    self._session is not None
+                    and self._session.door_ip == door_ip
+                    and self._session.state == "ringing"
+                )
+            if should_answer:
+                threading.Thread(target=self._delayed_answer, name="AutoAnswer", daemon=True).start()
+
+    def _delayed_answer(self) -> None:
+        time.sleep(1.2)
+        with self._session_lock:
+            session = self._session
+            if not session or session.state != "ringing":
+                return
+        self._answer_call()
+
     def _auto_close_idle_media(self, *, keep_door_id: str, reason: str) -> None:
         with self._session_lock:
             open_doors = set(self._idle_open_doors) | set(self._idle_video_hb.keys())
@@ -488,7 +605,9 @@ class Gateway:
         self._bell.stop("answered")
         self._rtsp.ensure_audio()
 
-        # 发送一次 b1，然后启动 b3 心跳
+        # 实测节奏：开视频(106B) → 约 1.2s → 开音频 b1(77B) → b3 心跳
+        self._send_call_video()
+        time.sleep(1.2)
         self._send_answer_action()
         self._start_answer_heartbeat()
 
@@ -545,6 +664,22 @@ class Gateway:
             self._udp_send(door_ip, pkt)
         except Exception as e:
             _log(f"[CALL] send answer action failed: {e}")
+
+    def _send_call_video(self) -> None:
+        with self._session_lock:
+            session = self._session
+            if not session:
+                return
+            invite = session.invite
+            door_ip = session.door_ip
+            msg_id = session.tx_msg_id
+            session.tx_msg_id += 1
+
+        try:
+            pkt = build_call_video(msg_id=msg_id, invite=invite)
+            self._udp_send(door_ip, pkt)
+        except Exception as e:
+            _log(f"[CALL] send call video failed: {e}")
 
     def _start_answer_heartbeat(self) -> None:
         with self._session_lock:
@@ -673,6 +808,8 @@ class Gateway:
         if cmd == "audio":
             self._rtsp.ensure_audio()
             self._send_idle_hex(door_ip, HEX_AUDIO, tag="audio")
+            # 实测面板在音频模式下同样发 a4 心跳保活
+            self._start_idle_video_hb(door_id, door_ip)
             with self._session_lock:
                 self._idle_open_doors.add(door_id)
             return

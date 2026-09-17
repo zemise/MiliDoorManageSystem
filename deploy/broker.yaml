@@ -1,0 +1,10 @@
+# 板端 amqtt broker 配置
+# 用法（板端）：
+#   PYTHONPATH=/opt/mili-gateway/stubs:$PYTHONPATH amqtt -c /opt/mili-gateway/broker.yaml
+listeners:
+  default:
+    type: tcp
+    bind: 0.0.0.0:1883
+plugins:
+  amqtt.plugins.authentication.AnonymousAuthPlugin:
+    allow_anonymous: true

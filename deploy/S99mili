@@ -1,0 +1,53 @@
+#!/bin/sh
+# Mili Door Gateway 开机自启（BusyBox init 风格，LicheeRV Nano 实测）
+# 安装（板端）：
+#   cp S99mili /etc/init.d/S99mili
+#   chmod +x /etc/init.d/S99mili
+# 调试：
+#   /etc/init.d/S99mili restart
+# 日志：
+#   /var/log/amqtt.log          broker 日志
+#   /var/log/mili-gateway.log   gateway.py 日志
+
+DIR=/opt/mili-gateway
+BROKER_PID=/run/amqtt.pid
+GW_PID=/run/mili-gateway.pid
+
+case "$1" in
+  start)
+    echo "mili: swap"
+    [ -f /swapfile ] && swapon /swapfile 2>/dev/null || true
+    echo "mili: dns"
+    echo "nameserver 223.5.5.5" > /etc/resolv.conf
+    echo "nameserver 119.29.29.29" >> /etc/resolv.conf
+    if command -v ntpd >/dev/null 2>&1; then
+      ntpd -q -p 223.5.5.5 >/dev/null 2>&1 &
+    fi
+    echo "mili: broker"
+    cd "$DIR"
+    PYTHONPATH="$DIR/stubs:$PYTHONPATH" nohup amqtt -c "$DIR/broker.yaml" >/var/log/amqtt.log 2>&1 &
+    echo $! > "$BROKER_PID"
+    # 等 broker 端口就绪再启动 gateway（amqtt 在低速板子上启动较慢）
+    i=0
+    while [ $i -lt 15 ]; do
+      nc -z -w 1 127.0.0.1 1883 2>/dev/null && break
+      sleep 1
+      i=$((i+1))
+    done
+    echo "mili: gateway"
+    set -a; . "$DIR/gateway.env"; set +a
+    nohup python3 "$DIR"/gateway.py >/var/log/mili-gateway.log 2>&1 &
+    echo $! > "$GW_PID"
+    ;;
+  stop)
+    [ -f "$GW_PID" ] && kill $(cat "$GW_PID") 2>/dev/null
+    [ -f "$BROKER_PID" ] && kill $(cat "$BROKER_PID") 2>/dev/null
+    ;;
+  restart)
+    "$0" stop; sleep 1; "$0" start
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|restart}"
+    exit 1
+    ;;
+esac

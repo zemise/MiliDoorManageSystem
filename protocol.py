@@ -12,6 +12,13 @@ from typing import Optional
 _PREAMBLE = bytes.fromhex("08ff0108")
 _MAGIC = b"SG\x00\x00"
 
+# 空闲态固定开锁报文。
+# 这是从现有抓包中整理出的 a0 指令，适用于“非通话中”的直接开锁。
+_IDLE_UNLOCK_HEX = (
+    "08ff0108000000000000000000000000534700001f0200002b000000000028001f020000010101003200010000000000"
+    "46b4e41131000100000000000000000032aaf0a000010000"
+)
+
 # 本文件集中管理协议原语：
 # - 基于抓包知识解析 UDP/14301 控制帧
 # - 构建网关使用的控制帧（空闲和通话中）
@@ -128,25 +135,47 @@ def _extract_id_types_from_body(body: bytes) -> Optional[tuple[bytes, bytes]]:
 
 def parse_call_invite(pkt: CtrlPacket) -> Optional[CallInvite]:
     """
-    从 CtrlPacket 解析"来电"邀请。
+    从 CtrlPacket 解析"来电"邀请，兼容两种实测格式。
 
-    基于提供的抓包的启发式规则：
-      - kind == 0x17
-      - body_len == 203 (0xCB)
+    旧格式（早期抓包）：
+      - kind == 0x17, body_len == 203 (0xCB)
       - body 包含 `aa f0 b0`
       - session_id 位于 `aa f0 b0 0001a300` 段之后的 4 字节
+
+    新格式（现场门禁实测广播邀请）：
+      - kind == 0x17, body_len == 50 (0x32)
+      - body: msg_id(4) + 0101ff00 + 3100010000000000
+              + door_id(4) + 00000100 + session_id(4) + session_id(4)
+              + 31aaff56 + 00010a00 + "230020103_"
     """
-    if pkt.kind != 0x17 or pkt.body_len != 203:
+    if pkt.kind != 0x17 or pkt.body_len not in (203, 50):
         return None
 
     body = pkt.body
-    if len(body) < 60:
+    if len(body) < 50:
         return None
 
     if _u32_le(body[0:4]) != pkt.msg_id:
         # 在抓包中，body 以重复的 msg_id 开始；要求匹配以减少误报
         return None
 
+    if pkt.body_len == 50:
+        # 新格式
+        door_id = body[16:20]
+        session_id = body[24:28]
+        # 构造 5 字节 id_type 字段，供构建器使用（保持旧构建器接口不变）
+        door_id_type = door_id + b"\x31"
+        user_id_type = bytes.fromhex("46b4e411") + b"\x32"
+        return CallInvite(
+            door_ip=pkt.src_ip,
+            door_id_type=door_id_type,
+            user_id_type=user_id_type,
+            session_id=session_id,
+            invite_msg_id=pkt.msg_id,
+            raw_packet=pkt,
+        )
+
+    # 旧格式
     marker = body.find(b"\xaa\xf0\xb0")
     if marker == -1:
         return None
@@ -197,140 +226,134 @@ def _build_outer_packet(*, msg_id: int, kind: int, body: bytes) -> bytes:
     return bytes(header) + body
 
 
-_ID_GAP = bytes.fromhex("00010000000000")  # 7 bytes between id_type fields in samples
+# 以下构建器基于 2026-09-17 实测面板 ↔ 户外机抓包。
+# 关键差异（相对早期抓包）：kind 一律 0x2b；面板 ID=46b4e411；户外机 ID=40b0e411。
+_ID_PREFIX = bytes.fromhex("0101ff003200010000000000")  # msg_id 之后的固定前缀
+_USER_GAP = bytes.fromhex("3100010000000000")            # 面板 ID 之后
 
 
-# "已连接/端口协商"消息使用的尾部段（kind=0x33, body_len=74）
-_CONNECTED_TAIL = bytes.fromhex(
-    "00f0b000012200b40000000000"
-    "bc7ab27a"  # 音频/视频端口：31420/31410（小端序，匹配 AUDIO_UDP_PORT/VIDEO_UDP_PORT）
-    "010f050000a00f0000000000000000000100000000000000"
-)
+def _body_with_ids(msg_id: int, invite: CallInvite) -> bytearray:
+    """构建呼叫中消息的公共前缀：msg_id + 固定前缀 + 面板ID + gap + 户外ID。"""
+    body = bytearray()
+    body += struct.pack("<I", msg_id)
+    body += _ID_PREFIX
+    body += invite.user_id_type[:4]
+    body += _USER_GAP
+    body += invite.door_id_type[:4]
+    return body
 
 
 def build_connected_ack(invite: CallInvite) -> bytes:
     """
-    为给定的呼叫邀请构建"已连接"响应。
+    来电邀请的应答（88 字节，实测面板"接听"前的应答）。
 
-    此消息在抓包中没有命令标记（`aa f0`）；通过 kind=0x33, body_len=0x4A 识别。
-
-    body 中的大多数字节是从抓包中提取的常量，但以下内容从邀请中动态填充：
-      - msg_id (u32)
-      - door_id_type (5 字节)
-      - user_id_type (4+1 字节)
+    body(56): msg_id + 前缀 + 面板ID + gap + 户外ID + 3200ff56 + 00011000
+              + 3200010000000000 + 面板ID + 3114a8c0
     """
     msg_id = invite.invite_msg_id
-    door_id_type = invite.door_id_type
     user_id = invite.user_id_type[:4]
-    user_type = invite.user_id_type[4:5]  # single byte
+    door_id = invite.door_id_type[:4]
 
     body = bytearray()
     body += struct.pack("<I", msg_id)
-    body += bytes.fromhex("0101ff003200010000000000")  # 固定头部段（标志/保留；含义未知）
-    body += door_id_type
-    body += _ID_GAP
+    body += _ID_PREFIX
     body += user_id
-    body += user_type
-    body += _CONNECTED_TAIL
+    body += _USER_GAP
+    body += door_id
+    body += bytes.fromhex("3200ff5600011000")
+    body += bytes.fromhex("3200010000000000")
+    body += user_id
+    body += bytes.fromhex("3114a8c0")
 
+    if len(body) != 56:
+        raise ValueError(f"connected body len mismatch: {len(body)} != 56")
+    return _build_outer_packet(msg_id=msg_id, kind=0x2b, body=bytes(body))
+
+
+def build_call_video(*, msg_id: int, invite: CallInvite) -> bytes:
+    """
+    通话建立后打开视频（106 字节，实测）。
+
+    body(74): msg_id + 前缀 + 面板ID + gap + 户外ID + 3200f0b0 00012200 b400000000
+              + 0000bc7a b27a0114 05000040 1f000000 00000000 00000100 00000000 0000
+    """
+    body = _body_with_ids(msg_id, invite)
+    body += bytes.fromhex("3200f0b000012200b40000000000bc7ab27a0114050000401f0000000000000000000100000000000000")
     if len(body) != 74:
-        raise ValueError(f"connected body len mismatch: {len(body)} != 74")
-
-    return _build_outer_packet(msg_id=msg_id, kind=0x33, body=bytes(body))
+        raise ValueError(f"call video body len mismatch: {len(body)} != 74")
+    return _build_outer_packet(msg_id=msg_id, kind=0x2b, body=bytes(body))
 
 
 def build_answer_action(*, msg_id: int, invite: CallInvite) -> bytes:
     """
-    构建 b1（接听动作）。
+    打开音频/通话动作 b1（77 字节，实测）。
 
-    body 中的关键标记是：`aa f0 b1 ... <session_id>`
+    body(45): msg_id + 前缀 + 面板ID + gap + 户外ID + 32aaf0b1 00010500 + session + 04
     """
-    door_id_type = invite.door_id_type
-    user_id = invite.user_id_type[:4]
-    user_type = invite.user_id_type[4:5]
-    session_id = invite.session_id
-
-    body = bytearray()
-    body += struct.pack("<I", msg_id)
-    body += bytes.fromhex("0101ff003200010000000000")  # 固定头部段（未知字段）
-    body += door_id_type
-    body += _ID_GAP
-    body += user_id
-    body += user_type
-    body += bytes.fromhex("aaf0b100010500")
-    body += session_id
+    body = _body_with_ids(msg_id, invite)
+    body += bytes.fromhex("32aaf0b100010500")
+    body += invite.session_id
     body += bytes.fromhex("04")
-
-    return _build_outer_packet(msg_id=msg_id, kind=0x33, body=bytes(body))
+    if len(body) != 45:
+        raise ValueError(f"answer action body len mismatch: {len(body)} != 45")
+    return _build_outer_packet(msg_id=msg_id, kind=0x2b, body=bytes(body))
 
 
 def build_answer_heartbeat(*, msg_id: int, invite: CallInvite) -> bytes:
     """
-    构建 b3（接听心跳 1Hz）。
+    通话心跳 b3（76 字节，实测，1Hz）。
 
-    门禁设备期望在接听后每秒收到此数据包，否则可能会在其侧挂断通话。
+    body(44): msg_id + 前缀 + 面板ID + gap + 户外ID + 32aaf0b3 00010400 + session
     """
-    door_id_type = invite.door_id_type
-    user_id = invite.user_id_type[:4]
-    user_type = invite.user_id_type[4:5]
-    session_id = invite.session_id
-
-    body = bytearray()
-    body += struct.pack("<I", msg_id)
-    body += bytes.fromhex("0101ff003200010000000000")  # 固定头部段（未知字段）
-    body += door_id_type
-    body += _ID_GAP
-    body += user_id
-    body += user_type
-    body += bytes.fromhex("aaf0b300010400")
-    body += session_id
-
-    return _build_outer_packet(msg_id=msg_id, kind=0x33, body=bytes(body))
+    body = _body_with_ids(msg_id, invite)
+    body += bytes.fromhex("32aaf0b300010400")
+    body += invite.session_id
+    if len(body) != 44:
+        raise ValueError(f"answer heartbeat body len mismatch: {len(body)} != 44")
+    return _build_outer_packet(msg_id=msg_id, kind=0x2b, body=bytes(body))
 
 
 def build_hangup(*, msg_id: int, invite: CallInvite) -> bytes:
     """
-    构建 b2（结束/挂断）。
+    结束/挂断（72 字节，实测面板结束命令 a3）。
 
-    标记：`aa f0 b2 ... <session_id>`
+    body(40): msg_id + 前缀 + 面板ID + gap + 00000000 + 32aaf0a3 00010000
     """
-    door_id_type = invite.door_id_type
-    user_id = invite.user_id_type[:4]
-    user_type = invite.user_id_type[4:5]
-    session_id = invite.session_id
-
     body = bytearray()
     body += struct.pack("<I", msg_id)
-    body += bytes.fromhex("0101ff003200010000000000")  # 固定头部段（未知字段）
-    body += door_id_type
-    body += _ID_GAP
-    body += user_id
-    body += user_type
-    body += bytes.fromhex("aaf0b200010400")
-    body += session_id
-
-    return _build_outer_packet(msg_id=msg_id, kind=0x33, body=bytes(body))
+    body += _ID_PREFIX
+    body += invite.user_id_type[:4]
+    body += _USER_GAP
+    body += bytes.fromhex("0000000032aaf0a300010000")
+    if len(body) != 40:
+        raise ValueError(f"hangup body len mismatch: {len(body)} != 40")
+    return _build_outer_packet(msg_id=msg_id, kind=0x2b, body=bytes(body))
 
 
 def build_unlock(*, msg_id: int, invite: CallInvite) -> bytes:
     """
-    构建 a0（开锁），格式与通话流程中观察到的相同。
+    构建 a0（开锁），与新格式一致（kind=0x2b，面板 ID + a0）。
     """
-    door_id_type = invite.door_id_type
-    user_id = invite.user_id_type[:4]
-    user_type = invite.user_id_type[4:5]
-
     body = bytearray()
     body += struct.pack("<I", msg_id)
     # 注意：标志与其他消息不同（ff00 → 0101），基于抓包
     body += bytes.fromhex("010101003200010000000000")
-    body += door_id_type
-    body += _ID_GAP
-    body += user_id
-    body += user_type
-    body += bytes.fromhex("aaf0a000010000")
+    body += invite.user_id_type[:4]
+    body += bytes.fromhex("3100010000000000")
+    body += bytes.fromhex("0000000032aaf0a000010000")
+    if len(body) != 40:
+        raise ValueError(f"unlock body len mismatch: {len(body)} != 40")
+    return _build_outer_packet(msg_id=msg_id, kind=0x2b, body=bytes(body))
 
-    return _build_outer_packet(msg_id=msg_id, kind=0x33, body=bytes(body))
+
+def build_idle_unlock() -> bytes:
+    """
+    构建空闲态开锁报文。
+
+    当门禁当前不在通话会话中时，可以直接发送此固定 UDP 负载到门禁的
+    控制端口（默认 14301）执行开锁。
+    """
+    return binascii.unhexlify(_IDLE_UNLOCK_HEX)
 
 
 def hexlify(b: bytes) -> str:

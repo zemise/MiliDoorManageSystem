@@ -1,0 +1,33 @@
+#!/bin/sh /etc/rc.common
+# OpenWrt/Tina (procd) 自启动脚本
+# 安装：
+#   cp gateway.init /etc/init.d/mili-gateway
+#   chmod +x /etc/init.d/mili-gateway
+#   /etc/init.d/mili-gateway enable
+#   /etc/init.d/mili-gateway start
+# 日志：
+#   logread | grep mili-gateway
+
+START=99
+STOP=10
+USE_PROCD=1
+
+DIR=/opt/mili-gateway
+
+start_service() {
+    if [ ! -f "$DIR/gateway.env" ]; then
+        echo "missing $DIR/gateway.env" >&2
+        exit 1
+    fi
+    procd_open_instance
+    procd_set_param command /bin/sh "$DIR/start_gateway.sh"
+    procd_set_param respawn 3600 5 5
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
+
+stop_service() {
+    # gateway.py 只有前台进程；procd 会负责终止 respawn 进程
+    :
+}

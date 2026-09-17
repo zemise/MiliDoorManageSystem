@@ -1,0 +1,16 @@
+[Unit]
+Description=Mili Door Gateway (MQTT <-> UDP control, RTP -> RTSP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/mili-gateway
+# gateway.env 不存在时继续启动（start_gateway.sh 会报错退出并触发重启）
+EnvironmentFile=-/opt/mili-gateway/gateway.env
+ExecStart=/bin/sh /opt/mili-gateway/start_gateway.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
